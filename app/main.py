@@ -11,6 +11,9 @@
 另提供脱敏结果快照：在单个一致性读事务内固定同一时点，按 subject_id
 稳定排序生成仅含已揭盲周期与完成时间的不可变 JSON 快照（附 SHA-256
 摘要），相同 operation_id 幂等重放同一快照，可按快照 ID 随时取回。
+另提供受试者换号：仅当原受试者从未揭盲时，在 BEGIN IMMEDIATE 事务内
+把隐藏分配与进度原子转移到新编号（序列内容及下标保持不变），原编号
+保留墓碑、此后不可复用；相同 operation_id 幂等重放，并提供换号审计接口。
 """
 
 from __future__ import annotations
@@ -45,6 +48,9 @@ from .schemas import (
     StateEventsOut,
     StateTransitionBatchOut,
     StateTransitionBatchRequest,
+    SubjectReplaceEventOut,
+    SubjectReplaceEventsOut,
+    SubjectReplaceRequest,
 )
 from .williams import group_size, williams_sequences
 
@@ -59,7 +65,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -670,3 +676,81 @@ def get_snapshot(experiment_id: str, snapshot_id: str) -> dict:
     if snapshot is None:
         raise HTTPException(status_code=404, detail="snapshot not found")
     return snapshot
+
+
+@app.post(
+    "/experiments/{experiment_id}/subjects/{subject_id}/replace",
+    response_model=SubjectReplaceEventOut,
+    summary=(
+        "受试者换号：仅当原受试者从未揭盲时，在单个写事务内把隐藏分配与进度"
+        "原子转移到新编号（序列内容及下标不变），原编号保留墓碑不可复用"
+    ),
+)
+def replace_subject(
+    experiment_id: str, subject_id: str, payload: SubjectReplaceRequest
+) -> dict:
+    if payload.replacement_subject_id == subject_id:
+        raise HTTPException(
+            status_code=422,
+            detail="replacement_subject_id 不能与原受试者编号相同",
+        )
+    try:
+        event = db.replace_subject(
+            experiment_id,
+            subject_id,
+            payload.replacement_subject_id,
+            payload.operation_id,
+            payload.reason,
+        )
+    except db.SubjectReplacementOperationIdConflictError:
+        # 同一 operation_id 绑定了不同的原 / 新编号或原因
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "operation_id 已被原 / 新编号或原因不同的其他换号请求占用",
+                "reason": "operation_id_conflict",
+                "operation_id": payload.operation_id,
+            },
+        )
+    except db.SubjectReplacementConflictError as exc:
+        # 新编号已存在 / 原编号已揭盲 / 原编号已换号（含并发换号）
+        messages = {
+            "replacement_subject_exists": "新受试者编号已存在（在册或历史编号不可复用）",
+            "subject_already_unblinded": "原受试者已揭盲，不能换号",
+            "original_already_replaced": "原受试者编号已换号，只剩墓碑且不可复用",
+        }
+        detail = {
+            "message": messages[exc.reason],
+            "reason": exc.reason,
+            "original_subject_id": subject_id,
+            "replacement_subject_id": payload.replacement_subject_id,
+        }
+        raise HTTPException(status_code=409, detail=detail)
+    if event is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "实验或受试者不存在",
+                "experiment_id": experiment_id,
+                "subject_id": subject_id,
+            },
+        )
+    return event
+
+
+@app.get(
+    "/experiments/{experiment_id}/subject-replacement-events",
+    response_model=SubjectReplaceEventsOut,
+    summary="查询受试者换号审计记录（不含条件内容），按时间倒序分页",
+)
+def list_subject_replacements(
+    experiment_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    events = db.list_subject_replacements(
+        experiment_id, limit=limit, offset=offset
+    )
+    if events is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return {"experiment_id": experiment_id, "events": events}

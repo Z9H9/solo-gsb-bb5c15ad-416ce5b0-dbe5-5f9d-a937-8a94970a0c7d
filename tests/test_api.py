@@ -3686,3 +3686,603 @@ def test_legacy_database_supports_snapshots_after_migration(
         )
         assert refetched.status_code == 200
         assert refetched.json() == empty.json()
+
+
+# ---------- 受试者换号（subject replacement） ----------
+
+def replace_subject(
+    client: TestClient,
+    experiment_id: str,
+    subject_id: str,
+    replacement_subject_id: str,
+    operation_id: str,
+    reason: str = "编号登记错误",
+):
+    return client.post(
+        f"/experiments/{experiment_id}/subjects/{subject_id}/replace",
+        json={
+            "replacement_subject_id": replacement_subject_id,
+            "operation_id": operation_id,
+            "reason": reason,
+        },
+    )
+
+
+def test_replace_subject_transfers_assignment_and_progress_atomically(
+    client: TestClient,
+) -> None:
+    # 序列长度为 3：先记录 s0 的完整序列，换号后新编号必须得到同一条序列
+    body, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)],
+        seed=7,
+    )
+    eid = body["experiment_id"]
+    original_sequence = reveal_sequence(client, eid, "s5", 3)
+
+    # 重新创建一个干净的同分配实验用于换号（避免上面已揭盲）
+    body, _ = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=[f"t{i}" for i in range(6)],
+        seed=7,
+    )
+    eid = body["experiment_id"]
+
+    resp = replace_subject(client, eid, "t5", "z5", "rep-1", "入组编号录入错误")
+    assert resp.status_code == 200, resp.text
+    event = resp.json()
+    assert event["experiment_id"] == eid
+    assert event["original_subject_id"] == "t5"
+    assert event["replacement_subject_id"] == "z5"
+    assert event["operation_id"] == "rep-1"
+    assert event["reason"] == "入组编号录入错误"
+    assert "id" in event
+    assert "created_at" in event
+    # 审计记录不含任何条件内容 / 序列下标
+    assert_no_sequence_leak(event)
+
+    # 名册：t5 被 z5 替换，其余不变；num_subjects 不变，名册位置保留
+    detail = client.get(f"/experiments/{eid}").json()
+    assert [a["subject_id"] for a in detail["assignments"]] == [
+        f"t{i}" if i != 5 else "z5" for i in range(6)
+    ]
+    assert detail["num_subjects"] == 6
+
+    # 新编号持有的序列与下标完全不变（与首次同种子分配一致）
+    assert reveal_sequence(client, eid, "z5", 3) == original_sequence
+
+    # 其他受试者不受影响
+    assert client.get(f"/experiments/{eid}/subjects/t0/progress").status_code == 200
+
+
+def test_replace_preserves_existing_progress_without_unblinding(
+    client: TestClient,
+) -> None:
+    # 推进门禁要求“从未揭盲”指没有任何 unblindings；构造一个只推进但通过
+    # 事务外无法只写 progress 的场景，故此处验证零揭盲受试者的标准路径：
+    # 换号前 next_period=1、reveals=[]，换号后新编号完全一致。
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid = body["experiment_id"]
+
+    assert replace_subject(client, eid, "s1", "s1-new", "rep-1").status_code == 200
+
+    progress = client.get(
+        f"/experiments/{eid}/subjects/s1-new/progress"
+    ).json()
+    assert progress["subject_id"] == "s1-new"
+    assert progress["next_period"] == 1
+    assert progress["reveals"] == []
+
+    # 新编号可正常揭盲推进
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1-new", "expected_period": 1, "request_id": "a1"},
+    ).status_code == 200
+
+
+def test_replace_tombstone_blocks_reuse_query_and_advance(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid = body["experiment_id"]
+    assert replace_subject(client, eid, "s1", "s9", "rep-1").status_code == 200
+
+    # 原编号不能查询进度
+    assert client.get(
+        f"/experiments/{eid}/subjects/s1/progress"
+    ).status_code == 404
+    # 原编号不能推进 / 完成
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a"},
+    ).status_code == 404
+    assert client.post(
+        f"/experiments/{eid}/complete",
+        json={"subject_id": "s1", "period": 1, "request_id": "c"},
+    ).status_code == 404
+
+    # 原编号不能作为新编号复用
+    resp = replace_subject(client, eid, "s2", "s1", "rep-2")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "replacement_subject_exists"
+
+    # 原编号不能作为换号起点（只剩墓碑；含并发换号语义）
+    resp = replace_subject(client, eid, "s1", "s10", "rep-3")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "original_already_replaced"
+
+
+def test_replace_rejects_when_original_was_unblinded(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=8
+    )
+    eid = body["experiment_id"]
+    # 按周期揭盲过周期 1
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    ).status_code == 200
+
+    resp = replace_subject(client, eid, "s1", "s9", "rep-1")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "subject_already_unblinded"
+    assert_no_sequence_leak(resp.json())
+
+    # 零写入：名册仍是 s1，进度仍是已揭盲状态，无审计记录
+    detail = client.get(f"/experiments/{eid}").json()
+    assert [a["subject_id"] for a in detail["assignments"]] == ["s1", "s2"]
+    progress = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert progress["next_period"] == 2
+    assert client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"] == []
+
+    # 冲突不消耗 operation_id：修正目标（换一个未揭盲受试者）仍可首次成功
+    ok = replace_subject(client, eid, "s2", "s8", "rep-1")
+    assert ok.status_code == 200
+
+
+def test_replace_rejects_when_original_was_emergency_unblinded(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    # 紧急揭盲完成（带外揭盲）也视为“已揭盲”
+    assert emergency_unblind(client, eid, "s1", "alice", "eu-1").status_code == 200
+    assert emergency_unblind(client, eid, "s1", "bob", "eu-2").status_code == 200
+
+    resp = replace_subject(client, eid, "s1", "s9", "rep-1")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "subject_already_unblinded"
+    assert_no_sequence_leak(resp.json())
+
+    # 零写入：名册不变、无换号审计
+    assert [
+        a["subject_id"]
+        for a in client.get(f"/experiments/{eid}").json()["assignments"]
+    ] == ["s1", "s2"]
+    assert client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"] == []
+
+
+def test_replace_rejects_existing_or_historical_replacement_id(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2", "s3", "s4"],
+        seed=2,
+    )
+    eid = body["experiment_id"]
+
+    # 新编号与在册编号重合 -> 409
+    resp = replace_subject(client, eid, "s1", "s2", "rep-1")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "replacement_subject_exists"
+
+    assert replace_subject(client, eid, "s1", "s9", "rep-2").status_code == 200
+
+    # 历史新编号 s9 不能再次被占用（换另一个未揭盲受试者也不行）
+    resp = replace_subject(client, eid, "s2", "s9", "rep-3")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "replacement_subject_exists"
+
+    # 历史原编号 s1（墓碑）不能作为新编号
+    resp = replace_subject(client, eid, "s3", "s1", "rep-4")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "replacement_subject_exists"
+
+    # 上述冲突均零写入：只有 rep-2 一条审计
+    events = client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"]
+    assert [e["operation_id"] for e in events] == ["rep-2"]
+    # 冲突不消耗 operation_id：rep-1 用于合法换号仍首次成功
+    assert replace_subject(client, eid, "s2", "s2-new", "rep-1").status_code == 200
+
+
+def test_replace_supports_chained_replacements(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+    # 先取 s1 的期望序列（用同种子独立实验，避免在本实验揭盲）
+    setup = client.post(
+        "/experiments",
+        json={"conditions": ["A", "B"], "subject_ids": ["x1", "x2"], "seed": 5},
+    ).json()
+    expected = reveal_sequence(client, setup["experiment_id"], "x1", 2)
+
+    # s1 -> s9 -> s18 连续换号（每次都未揭盲）
+    assert replace_subject(client, eid, "s1", "s9", "rep-1").status_code == 200
+    assert replace_subject(client, eid, "s9", "s18", "rep-2").status_code == 200
+
+    detail = client.get(f"/experiments/{eid}").json()
+    assert [a["subject_id"] for a in detail["assignments"]] == ["s18", "s2"]
+
+    # s1、s9 都不可复用 / 查询 / 推进
+    for old in ("s1", "s9"):
+        assert client.get(
+            f"/experiments/{eid}/subjects/{old}/progress"
+        ).status_code == 404
+        assert replace_subject(client, eid, old, "zz", "x").status_code == 409
+
+    # 当前编号 s18 持有的序列仍是最初 s1 的那条
+    assert reveal_sequence(client, eid, "s18", 2) == expected
+
+    # 审计按时间倒序：rep-2 在前
+    events = client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"]
+    assert [
+        (e["original_subject_id"], e["replacement_subject_id"]) for e in events
+    ] == [("s9", "s18"), ("s1", "s9")]
+
+
+def test_replace_operation_id_replays_first_result(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=9
+    )
+    eid = body["experiment_id"]
+    payload = {
+        "replacement_subject_id": "s9",
+        "operation_id": "rep-idem",
+        "reason": "同一种原因",
+    }
+    first = client.post(
+        f"/experiments/{eid}/subjects/s1/replace", json=payload
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    for _ in range(3):
+        replay = client.post(
+            f"/experiments/{eid}/subjects/s1/replace", json=payload
+        )
+        assert replay.status_code == 200
+        assert replay.json() == first_body
+
+    # 重放不产生额外审计
+    events = client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"]
+    assert len(events) == 1
+
+
+def test_replace_operation_id_conflict_on_different_binding(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid = body["experiment_id"]
+    assert (
+        replace_subject(client, eid, "s1", "s9", "shared", "reason-1").status_code
+        == 200
+    )
+
+    # 不同原因
+    conflict = replace_subject(client, eid, "s1", "s9", "shared", "reason-2")
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "operation_id_conflict"
+    assert conflict.json()["detail"]["operation_id"] == "shared"
+
+    # 不同新编号
+    conflict = client.post(
+        f"/experiments/{eid}/subjects/s1/replace",
+        json={"replacement_subject_id": "s10", "operation_id": "shared",
+              "reason": "reason-1"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "operation_id_conflict"
+
+    # 不同原编号
+    conflict = client.post(
+        f"/experiments/{eid}/subjects/s2/replace",
+        json={"replacement_subject_id": "s9", "operation_id": "shared",
+              "reason": "reason-1"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["reason"] == "operation_id_conflict"
+    assert_no_sequence_leak(conflict.json())
+
+    # 只有首次一条审计
+    events = client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"]
+    assert [e["operation_id"] for e in events] == ["shared"]
+
+
+def test_replace_unknown_experiment_or_subject_returns_404(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=6
+    )
+    eid = body["experiment_id"]
+
+    assert replace_subject(client, "missing", "s1", "s9", "r1").status_code == 404
+    assert replace_subject(client, eid, "ghost", "s9", "r2").status_code == 404
+
+    # 404 不消耗 operation_id：用于合法换号仍首次成功
+    assert replace_subject(client, eid, "s1", "s9", "r1").status_code == 200
+    events = client.get(
+        f"/experiments/{eid}/subject-replacement-events"
+    ).json()["events"]
+    assert [e["operation_id"] for e in events] == ["r1"]
+
+
+def test_replace_payload_validation(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=2
+    )
+    eid = body["experiment_id"]
+    base = {"replacement_subject_id": "s9", "operation_id": "op", "reason": "r"}
+
+    for field in ("replacement_subject_id", "operation_id", "reason"):
+        missing = {k: v for k, v in base.items() if k != field}
+        assert client.post(
+            f"/experiments/{eid}/subjects/s1/replace", json=missing
+        ).status_code == 422
+        empty = {**base, field: ""}
+        assert client.post(
+            f"/experiments/{eid}/subjects/s1/replace", json=empty
+        ).status_code == 422
+
+    # 新编号与原编号相同 -> 422
+    assert client.post(
+        f"/experiments/{eid}/subjects/s1/replace",
+        json={"replacement_subject_id": "s1", "operation_id": "op",
+              "reason": "r"},
+    ).status_code == 422
+
+    # 校验失败不消耗 operation_id
+    assert replace_subject(client, eid, "s1", "s9", "op", "r").status_code == 200
+
+
+def test_replace_events_listed_reverse_chronologically_with_paging(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"],
+        subject_ids=[f"s{i}" for i in range(8)], seed=3,
+    )
+    eid = body["experiment_id"]
+    for i in range(3):
+        assert replace_subject(
+            client, eid, f"s{i}", f"n{i}", f"rep-{i}", f"原因 {i}"
+        ).status_code == 200
+
+    resp = client.get(f"/experiments/{eid}/subject-replacement-events")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["experiment_id"] == eid
+    events = payload["events"]
+    # 最新在前
+    assert [e["operation_id"] for e in events] == ["rep-2", "rep-1", "rep-0"]
+    assert events[0]["id"] > events[1]["id"] > events[2]["id"]
+    assert all("created_at" in e for e in events)
+    assert_no_sequence_leak(payload)
+
+    # limit / offset 分页
+    page1 = client.get(
+        f"/experiments/{eid}/subject-replacement-events?limit=2"
+    ).json()["events"]
+    assert [e["operation_id"] for e in page1] == ["rep-2", "rep-1"]
+    page2 = client.get(
+        f"/experiments/{eid}/subject-replacement-events?limit=2&offset=2"
+    ).json()["events"]
+    assert [e["operation_id"] for e in page2] == ["rep-0"]
+
+    # 非法分页参数
+    assert client.get(
+        f"/experiments/{eid}/subject-replacement-events?limit=0"
+    ).status_code == 422
+    assert client.get(
+        f"/experiments/{eid}/subject-replacement-events?limit=501"
+    ).status_code == 422
+    assert client.get(
+        f"/experiments/{eid}/subject-replacement-events?offset=-1"
+    ).status_code == 422
+
+    # 没有换号记录的实验返回空列表
+    fresh, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=2
+    )
+    empty = client.get(
+        f"/experiments/{fresh['experiment_id']}/subject-replacement-events"
+    ).json()
+    assert empty == {"experiment_id": fresh["experiment_id"], "events": []}
+
+    # 实验不存在 -> 404
+    assert client.get(
+        "/experiments/missing/subject-replacement-events"
+    ).status_code == 404
+
+
+def test_replace_allowed_while_paused_and_does_not_change_version(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    assert pause_experiment(client, eid, "hold").status_code == 200
+
+    # 换号是行政性元数据变更，不是揭盲：暂停期间仍允许，且不动状态 / 版本
+    resp = replace_subject(client, eid, "s1", "s9", "rep-1")
+    assert resp.status_code == 200
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["status"] == "paused"
+    assert detail["state_version"] == 1
+
+
+def test_replace_excluded_from_snapshot_and_snapshot_uses_new_id(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=3
+    )
+    eid = body["experiment_id"]
+    assert replace_subject(client, eid, "s1", "s9", "rep-1").status_code == 200
+
+    resp = create_snapshot(client, eid, operation_id="snap-rep")
+    assert resp.status_code == 200
+    subject_ids = [
+        s["subject_id"] for s in resp.json()["snapshot"]["subjects"]
+    ]
+    # 快照名册使用新编号，原墓碑编号不出现
+    assert subject_ids == ["s2", "s9"]
+    assert_no_sequence_leak(resp.json())
+
+
+def test_concurrent_replacements_have_single_winner(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-replace.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={"conditions": ["A", "B"], "subject_ids": ["s1", "s2"], "seed": 71},
+        ).json()
+    eid = created["experiment_id"]
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    reasons: list[str | None] = []
+    results_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            # 所有线程并发把同一个原编号 s1 换成各自不同的新编号
+            resp = replace_subject(
+                local_client, eid, "s1", f"s9-{i}", f"rep-{i}"
+            )
+            with results_lock:
+                statuses.append(resp.status_code)
+                reasons.append(
+                    resp.json().get("detail", {}).get("reason")
+                    if resp.status_code != 200
+                    else None
+                )
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE 串行化：只有一次换号成功，其余看到原编号已成墓碑
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+    assert reasons.count(None) == 1
+    assert set(r for r in reasons if r is not None) == {"original_already_replaced"}
+
+    with TestClient(app) as verify:
+        detail = verify.get(f"/experiments/{eid}").json()
+        roster = [a["subject_id"] for a in detail["assignments"]]
+        # 恰好一个 s9-k 替换了 s1，s1 不在名册
+        assert "s1" not in roster
+        assert sum(1 for s in roster if s.startswith("s9-")) == 1
+        events = verify.get(
+            f"/experiments/{eid}/subject-replacement-events"
+        ).json()["events"]
+        assert len(events) == 1
+
+
+def test_legacy_database_supports_subject_replacement_after_migration(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "legacy-replace.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-rep", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-rep", "s1", 0, '["A","B"]'),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-rep", "s2", 1, '["B","A"]'),
+        )
+
+    with TestClient(app) as migrated:
+        resp = replace_subject(migrated, "legacy-rep", "s1", "s9", "lg-rep-1")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["replacement_subject_id"] == "s9"
+
+        # 新编号持有旧库中原序列
+        adv = migrated.post(
+            "/experiments/legacy-rep/advance",
+            json={"subject_id": "s9", "expected_period": 1, "request_id": "a1"},
+        )
+        assert adv.status_code == 200
+        assert adv.json()["condition"] == "A"
+
+        # 幂等重放
+        replay = replace_subject(migrated, "legacy-rep", "s1", "s9", "lg-rep-1")
+        assert replay.status_code == 200
+        assert replay.json() == resp.json()
+
+        # 审计可分页查询
+        events = migrated.get(
+            "/experiments/legacy-rep/subject-replacement-events"
+        ).json()["events"]
+        assert [e["operation_id"] for e in events] == ["lg-rep-1"]
+        assert_no_sequence_leak(events)

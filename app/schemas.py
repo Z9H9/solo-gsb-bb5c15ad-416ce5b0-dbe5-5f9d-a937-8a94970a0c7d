@@ -430,3 +430,38 @@ class SnapshotOut(BaseModel):
     digest: str
     created_at: str
     snapshot: SnapshotContent
+
+
+class SubjectReplaceRequest(BaseModel):
+    """受试者换号请求：把原编号替换为新编号（原编号保留墓碑）。"""
+
+    replacement_subject_id: str = Field(
+        ..., min_length=1, description="新受试者编号；不得与在册或历史编号重合"
+    )
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本次换号的唯一操作键（如 UUID），相同操作重试必须复用",
+    )
+    reason: str = Field(
+        ..., min_length=1, description="换号原因（必填），随审计记录持久化"
+    )
+
+
+class SubjectReplaceEventOut(BaseModel):
+    """一条受试者换号审计记录（只含原 / 新编号与原因，不含任何条件内容）。"""
+
+    id: int
+    experiment_id: str
+    operation_id: str
+    original_subject_id: str
+    replacement_subject_id: str
+    reason: str
+    created_at: str
+
+
+class SubjectReplaceEventsOut(BaseModel):
+    """换号审计列表，按时间倒序（最新在前）。"""
+
+    experiment_id: str
+    events: list[SubjectReplaceEventOut]
