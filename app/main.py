@@ -11,6 +11,9 @@
 另提供脱敏结果快照：在单个一致性读事务内固定同一时点，按 subject_id
 稳定排序生成仅含已揭盲周期与完成时间的不可变 JSON 快照（附 SHA-256
 摘要），相同 operation_id 幂等重放同一快照，可按快照 ID 随时取回。
+另提供受试者换号：仅允许原受试者从未揭盲时，在单个写事务内把隐藏分配
+（序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑不可复用、
+不可查询或推进，并追加不含条件内容的换号审计（按时间倒序分页查询）。
 """
 
 from __future__ import annotations
@@ -45,6 +48,9 @@ from .schemas import (
     StateEventsOut,
     StateTransitionBatchOut,
     StateTransitionBatchRequest,
+    SubjectReplaceRequest,
+    SubjectReplacementEventOut,
+    SubjectReplacementEventsOut,
 )
 from .williams import group_size, williams_sequences
 
@@ -59,7 +65,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -275,6 +281,16 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
                 "reason": "experiment_paused",
             },
         )
+    except db.SubjectReplacedError:
+        # 该编号已因换号退役：不能推进，响应不泄露任何条件
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者编号已换号退役，不能推进",
+                "reason": "subject_replaced",
+                "subject_id": payload.subject_id,
+            },
+        )
 
     if result is None:
         raise HTTPException(
@@ -382,6 +398,16 @@ def complete_period(experiment_id: str, payload: CompleteRequest) -> dict:
                 "current_period": exc.current_period,
             },
         )
+    except db.SubjectReplacedError:
+        # 该编号已因换号退役：不能登记完成
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者编号已换号退役，不能登记完成",
+                "reason": "subject_replaced",
+                "subject_id": payload.subject_id,
+            },
+        )
 
     if result is None:
         raise HTTPException(
@@ -401,7 +427,18 @@ def complete_period(experiment_id: str, payload: CompleteRequest) -> dict:
     summary="查询受试者揭盲进度（已揭盲 / 已完成记录、next_period 与 next_available_at）",
 )
 def get_progress(experiment_id: str, subject_id: str) -> dict:
-    progress = db.get_progress(experiment_id, subject_id)
+    try:
+        progress = db.get_progress(experiment_id, subject_id)
+    except db.SubjectReplacedError:
+        # 该编号已因换号退役：不能查询进度
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者编号已换号退役，不能查询进度",
+                "reason": "subject_replaced",
+                "subject_id": subject_id,
+            },
+        )
     if progress is None:
         raise HTTPException(
             status_code=404,
@@ -599,6 +636,16 @@ def emergency_unblind(experiment_id: str, payload: EmergencyUnblindRequest) -> d
                 "reason": "window_expired",
             },
         )
+    except db.SubjectReplacedError:
+        # 该编号已因换号退役：不能发起紧急揭盲，不泄露任何序列
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者编号已换号退役，不能发起紧急揭盲",
+                "reason": "subject_replaced",
+                "subject_id": payload.subject_id,
+            },
+        )
     if result is None:
         raise HTTPException(
             status_code=404,
@@ -670,3 +717,93 @@ def get_snapshot(experiment_id: str, snapshot_id: str) -> dict:
     if snapshot is None:
         raise HTTPException(status_code=404, detail="snapshot not found")
     return snapshot
+
+
+@app.post(
+    "/experiments/{experiment_id}/subjects/{subject_id}/replace",
+    response_model=SubjectReplacementEventOut,
+    summary=(
+        "受试者换号：仅当原受试者从未揭盲时，在单个写事务内把隐藏分配"
+        "（序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑"
+        "（不可复用、不可查询进度或推进），并追加不含条件内容的审计记录"
+    ),
+)
+def replace_subject(
+    experiment_id: str, subject_id: str, payload: SubjectReplaceRequest
+) -> dict:
+    try:
+        result = db.replace_subject(
+            experiment_id,
+            subject_id,
+            payload.replacement_subject_id,
+            payload.operation_id,
+            payload.reason,
+        )
+    except db.ReplacementOperationIdConflictError:
+        # 同一 operation_id 绑定了不同的原 / 新编号或原因
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "operation_id 已被其他换号操作占用",
+                "reason": "operation_id_conflict",
+                "operation_id": payload.operation_id,
+            },
+        )
+    except db.SubjectReplacedError:
+        # 原编号已退役（墓碑）：不能再次换号
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者编号已换号退役，不能再次换号",
+                "reason": "subject_replaced",
+                "subject_id": subject_id,
+            },
+        )
+    except db.ReplacementSubjectExistsError:
+        # 新编号已存在（在册或已退役），不能复用
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "新受试者编号已存在，不能复用",
+                "reason": "replacement_subject_exists",
+                "replacement_subject_id": payload.replacement_subject_id,
+            },
+        )
+    except db.SubjectAlreadyUnblindedError:
+        # 原编号已发生过揭盲：不允许换号，不泄露任何条件
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该受试者已发生揭盲，不允许换号",
+                "reason": "subject_already_unblinded",
+                "subject_id": subject_id,
+            },
+        )
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "实验或受试者不存在",
+                "experiment_id": experiment_id,
+                "subject_id": subject_id,
+            },
+        )
+    return result
+
+
+@app.get(
+    "/experiments/{experiment_id}/subject-replacements",
+    response_model=SubjectReplacementEventsOut,
+    summary="查询受试者换号审计记录（不含条件内容），按时间倒序分页",
+)
+def list_subject_replacements(
+    experiment_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    replacements = db.list_subject_replacements(
+        experiment_id, limit=limit, offset=offset
+    )
+    if replacements is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return {"experiment_id": experiment_id, "replacements": replacements}

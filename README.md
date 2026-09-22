@@ -118,6 +118,32 @@ JSON 快照**，之后的揭盲 / 完成 / 暂停均不影响已生成快照：
 - 快照是纯只读流程：不推进任何进度、不消耗推进 / 完成幂等键，
   也不受实验暂停状态影响。
 
+## 受试者换号（subject replacement）
+
+针对受试者编号录入错误等场景，提供**从未揭盲受试者**的换号通道：
+
+- **换号** `POST /experiments/{id}/subjects/{subject_id}/replace`：请求体携带
+  `replacement_subject_id`（新编号）、`operation_id`（唯一操作键）与必填
+  `reason`。仅当原受试者**从未发生过任何揭盲**（无按周期揭盲记录，也未完成
+  紧急揭盲）时才允许操作；服务在**单个 SQLite 写事务（`BEGIN IMMEDIATE`）**内
+  把该受试者的隐藏分配（`assignments`，**序列内容与序列下标保持不变**）与
+  进度（`subject_progress`）**原子转移**到新编号，并追加一条**不含条件内容**
+  的换号审计记录；
+- **原编号保留墓碑**：换号后原编号立即退役——不能作为新编号复用、不能再次
+  换号、不能查询进度、不能推进 / 登记完成 / 发起紧急揭盲（单条与批量），
+  这些操作对退役编号一律返回 `409 subject_replaced`；
+- **冲突一律 `409` 且零写入**：新编号已存在（在册编号或已退役墓碑）返回
+  `replacement_subject_exists`；原编号已揭盲返回 `subject_already_unblinded`；
+  并发换号由写事务串行化，只有第一个提交的事务成功，其余看到墓碑返回
+  `subject_replaced`——所有失败路径不写入任何数据、不消耗 `operation_id`；
+- **幂等**：相同 `(实验, operation_id)` 且原 / 新编号与原因完全相同的重试
+  返回**首次结果**；同一 `operation_id` 绑定不同原 / 新编号或原因返回
+  `409 operation_id_conflict`；
+- **审计接口** `GET /experiments/{id}/subject-replacements`：按**时间倒序**
+  （最新在前）分页返回换号审计记录（原 / 新编号、原因、时间等元数据，
+  不含任何条件内容），支持 `limit`（1～500，默认 100）与 `offset`；
+- 换号不是揭盲：不受实验暂停状态影响，也不改变实验状态版本。
+
 ## 快速启动（Docker Compose，一条命令）
 
 ```bash
@@ -127,7 +153,8 @@ docker compose up --build
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
 启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换、
-紧急揭盲幂等、紧急揭盲审计与结果快照表通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，
+紧急揭盲幂等、紧急揭盲审计、结果快照与受试者换号表通过 `CREATE TABLE IF NOT EXISTS`
+自动补齐，
 `experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
 `ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
 状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停与恢复、紧急揭盲。
@@ -740,6 +767,78 @@ curl http://localhost:8000/experiments/<experiment_id>/snapshots/<snapshot_id>
 快照只增不改：之后的揭盲、完成、暂停 / 恢复均不影响已生成快照的内容与
 `digest`。快照或实验不存在（含跨实验取快照）返回 `404`。
 
+### 受试者换号 `POST /experiments/{experiment_id}/subjects/{subject_id}/replace`
+
+把从未揭盲受试者的隐藏分配与进度转移到新编号，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `replacement_subject_id` | 新受试者编号；必须未被占用（在册编号与已退役编号均不可复用） |
+| `operation_id` | 本次换号的唯一操作键（如 UUID），相同操作重试必须复用 |
+| `reason` | 换号原因（必填，非空字符串），随审计记录持久化 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/<experiment_id>/subjects/s1/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"replacement_subject_id": "s1-new", "operation_id": "4e7b…",
+       "reason": "受试者编号录入错误"}'
+```
+
+仅当原受试者**从未揭盲**（无按周期揭盲记录，也未完成紧急揭盲）时返回 `200`，
+服务在单个写事务内把隐藏分配（序列内容与下标不变）与进度原子转移到新编号，
+响应即本次换号审计记录（不含任何条件内容）：
+
+```json
+{
+  "id": 1,
+  "experiment_id": "…",
+  "original_subject_id": "s1",
+  "replacement_subject_id": "s1-new",
+  "operation_id": "4e7b…",
+  "reason": "受试者编号录入错误",
+  "created_at": "2026-09-22T08:00:00.000000+00:00"
+}
+```
+
+冲突一律返回 `409` 且**零写入**（不消耗 `operation_id`），响应不揭露任何条件：
+
+- `replacement_subject_exists`：新编号已存在（在册编号或已退役墓碑）；
+- `subject_already_unblinded`：原受试者已发生过揭盲，不允许换号；
+- `subject_replaced`：原编号已退役（墓碑），不能再次换号；并发换号只有
+  第一个提交的事务成功，其余同样收到该原因；
+- `operation_id_conflict`：相同 `operation_id` 曾绑定不同的原 / 新编号或原因。
+
+换号后原编号保留墓碑：不能作为新编号复用、不能查询进度、不能推进 / 登记
+完成 / 发起紧急揭盲（这些操作对退役编号返回 `409 subject_replaced`）。
+相同 `(实验, operation_id)` 且原 / 新编号与原因完全相同的重试返回首次结果。
+实验或原受试者不存在返回 `404`；字段缺失或为空返回 `422`。
+
+### 查询换号审计 `GET /experiments/{experiment_id}/subject-replacements`
+
+返回换号审计记录（**不含任何条件内容**），按时间倒序（最新在前），支持分页：
+
+```bash
+curl 'http://localhost:8000/experiments/<experiment_id>/subject-replacements?limit=100&offset=0'
+```
+
+```json
+{
+  "experiment_id": "…",
+  "replacements": [
+    {"id": 2, "experiment_id": "…", "original_subject_id": "s2",
+     "replacement_subject_id": "s2-new", "operation_id": "91cd…",
+     "reason": "受试者退出后替补编号", "created_at": "…"},
+    {"id": 1, "experiment_id": "…", "original_subject_id": "s1",
+     "replacement_subject_id": "s1-new", "operation_id": "4e7b…",
+     "reason": "受试者编号录入错误", "created_at": "…"}
+  ]
+}
+```
+
+- `limit`：1～500，默认 `100`；`offset`：分页偏移，默认 `0`；非法值返回 `422`；
+- 审计记录只增不改；从未换号的实验返回 `replacements: []`；
+- 实验不存在返回 `404`。
+
 ### 其他接口
 
 - `GET /experiments/{experiment_id}`：查询实验（受试者名册 + 条件清单 +
@@ -751,7 +850,7 @@ curl http://localhost:8000/experiments/<experiment_id>/snapshots/<snapshot_id>
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -762,7 +861,7 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共十三张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十四张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
@@ -787,6 +886,10 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   - `result_snapshots`：脱敏结果快照，按 `(实验, operation_id)` 唯一约束
     保存首次请求绑定的字段白名单、不可变快照内容与 SHA-256 摘要
     （`id` 为快照 ID，可按需取回）；快照只增不改。
+  - `subject_replacements`：受试者换号的墓碑与追加式审计（合一张表）：
+    每行记录原编号（退役墓碑）、新编号、`operation_id`、原因与时间，
+    按 `(实验, operation_id)` 唯一约束支持幂等重放，按自增 `id` 时间倒序
+    分页查询；只含编号 / 原因 / 时间等元数据，**不含任何条件内容**。
 - **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
   “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
   恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，
@@ -826,3 +929,13 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
   `unblindings` 已揭盲记录。快照落盘后只增不改，相同 `operation_id` 重放
   与按快照 ID 取回的都是同一份内容；并发相同 `operation_id` 请求被写事务
   串行化，只生成一份快照，其余幂等重放。
+- **受试者换号的原子性与墓碑语义**：换号在单个 `BEGIN IMMEDIATE` 写事务内
+  完成“幂等检查 → 原编号在册且未退役校验 → 新编号未占用校验（在册与墓碑
+  均不可复用）→ 原编号从未揭盲校验（`unblindings` 与紧急揭盲 `unblinded`
+  审计均无记录）→ `assignments` 隐藏分配（序列内容与 `sequence_index` 不变）
+  与 `subject_progress` 进度改挂新编号 → 写入原编号墓碑与换号审计 → 提交”。
+  并发换号被写事务串行化：只有第一个提交的事务成功，其余看到墓碑而
+  `409 subject_replaced`；所有失败路径整体回滚、零写入、不消耗
+  `operation_id`。墓碑检查同样内嵌在单条 / 批量推进、完成登记、进度查询与
+  紧急揭盲的写事务（或查询）中，退役编号的一切后续操作一律
+  `409 subject_replaced`，不会泄露任何条件内容。

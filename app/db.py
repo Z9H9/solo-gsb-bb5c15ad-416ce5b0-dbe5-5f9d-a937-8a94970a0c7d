@@ -38,6 +38,14 @@
   （仅已揭盲周期与完成时间，按 ``subject_id`` 稳定排序，绝不包含
   ``sequence_index`` 或未揭盲安排）及其规范化 JSON 的 SHA-256 摘要；
   快照只增不改，可按快照 ID 随时取回同一份内容。
+* ``subject_replacements``：受试者换号的墓碑与追加式审计（合一张表）。
+  每行记录一次成功换号：原编号（``original_subject_id``，即退役墓碑）、
+  新编号（``replacement_subject_id``）、``operation_id`` 与原因，
+  按 ``(实验, operation_id)`` 唯一约束支持幂等重放，按自增 id 时间倒序
+  分页查询；只含编号 / 原因 / 时间等元数据，**不含任何条件内容**。
+  换号在单个 ``BEGIN IMMEDIATE`` 事务内把 ``assignments`` 的隐藏分配
+  （序列内容及下标不变）与 ``subject_progress`` 进度原子改挂到新编号，
+  仅允许原编号从未发生过任何揭盲（按周期揭盲或完成紧急揭盲）时操作。
 """
 
 from __future__ import annotations
@@ -195,6 +203,18 @@ CREATE TABLE IF NOT EXISTS result_snapshots (
     created_at    TEXT NOT NULL,         -- 与快照内 generated_at 同一固定时点
     UNIQUE (experiment_id, operation_id)
 );
+
+CREATE TABLE IF NOT EXISTS subject_replacements (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,  -- 单调主键，兼作时间倒序
+    experiment_id           TEXT NOT NULL REFERENCES experiments(id),
+    original_subject_id     TEXT NOT NULL,   -- 原编号（退役墓碑，不可复用 / 查询 / 推进）
+    replacement_subject_id  TEXT NOT NULL,   -- 新编号（接管隐藏分配与进度）
+    operation_id            TEXT NOT NULL,   -- 调用方幂等键
+    reason                  TEXT NOT NULL,   -- 换号原因（必填）
+    created_at              TEXT NOT NULL,
+    UNIQUE (experiment_id, operation_id),
+    UNIQUE (experiment_id, original_subject_id)
+);
 """
 
 
@@ -319,6 +339,31 @@ class EmergencyOperationIdConflictError(Exception):
 
 class SnapshotOperationIdConflictError(Exception):
     """operation_id 已被字段白名单不同的另一次快照请求占用。
+
+    冲突路径不携带任何条件 / 序列信息。
+    """
+
+
+class SubjectReplacedError(Exception):
+    """受试者编号已退役（换号墓碑）：不能复用、查询进度或推进。
+
+    冲突路径不携带任何条件 / 序列信息。
+    """
+
+
+class ReplacementSubjectExistsError(Exception):
+    """换号新编号已存在（在册编号或已退役墓碑），不能复用。"""
+
+
+class SubjectAlreadyUnblindedError(Exception):
+    """原受试者已发生过揭盲（按周期揭盲或完成紧急揭盲），不允许换号。
+
+    冲突路径不携带任何条件 / 序列信息。
+    """
+
+
+class ReplacementOperationIdConflictError(Exception):
+    """operation_id 已被另一个换号操作（不同原 / 新编号或原因）占用。
 
     冲突路径不携带任何条件 / 序列信息。
     """
@@ -527,6 +572,18 @@ def _get_experiment_meta(
     }
 
 
+def _is_tombstoned(
+    conn: sqlite3.Connection, experiment_id: str, subject_id: str
+) -> bool:
+    """该编号是否已因换号退役（存在墓碑记录）。"""
+    row = conn.execute(
+        "SELECT 1 FROM subject_replacements "
+        "WHERE experiment_id = ? AND original_subject_id = ?",
+        (experiment_id, subject_id),
+    ).fetchone()
+    return row is not None
+
+
 def _advance_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -565,6 +622,10 @@ def _advance_locked(
     # 暂停期间拒绝一切揭盲：幂等重放已在上方放行，此处不泄露任何条件
     if meta["status"] == "paused":
         raise ExperimentPausedError()
+
+    # 已退役编号（换号墓碑）不能推进：不揭露任何条件
+    if _is_tombstoned(conn, experiment_id, subject_id):
+        raise SubjectReplacedError()
 
     assignment_row = conn.execute(
         "SELECT sequence FROM assignments "
@@ -765,6 +826,15 @@ def _advance_batch_locked(
             (experiment_id, *subject_ids),
         ).fetchall()
     }
+    # 已退役编号（换号墓碑）不能参与批量揭盲
+    tombstoned_subjects = {
+        row["original_subject_id"]
+        for row in conn.execute(
+            f"SELECT original_subject_id FROM subject_replacements "
+            f"WHERE experiment_id = ? AND original_subject_id IN ({placeholders})",
+            (experiment_id, *subject_ids),
+        ).fetchall()
+    }
 
     # 同一批内同一受试者出现两次（周期不同）时，第二个人工复制的成员
     # 会以“推进后的下一周期”视角参与门禁校验，确保整批零写入而非部分推进
@@ -792,7 +862,9 @@ def _advance_batch_locked(
         failure: dict[str, Any] | None = None
 
         sequence_json = assignment_rows.get(subject_id)
-        if sequence_json is None:
+        if subject_id in tombstoned_subjects:
+            failure = {"subject_id": subject_id, "reason": "subject_replaced"}
+        elif sequence_json is None:
             failure = {"subject_id": subject_id, "reason": "subject_not_found"}
         else:
             sequence = json.loads(sequence_json)
@@ -988,9 +1060,11 @@ def _complete_locked(
             "_replayed": True,
         }
 
-    # 2) 实验 / 受试者必须存在
+    # 2) 实验 / 受试者必须存在；已退役编号（换号墓碑）不能登记完成
     if _get_washout(conn, experiment_id) is None:
         return None
+    if _is_tombstoned(conn, experiment_id, subject_id):
+        raise SubjectReplacedError()
     assignment_row = conn.execute(
         "SELECT sequence FROM assignments "
         "WHERE experiment_id = ? AND subject_id = ?",
@@ -1585,12 +1659,15 @@ def _emergency_unblind_locked(
         replay["_commit"] = False
         return replay
 
-    # 2) 实验与受试者必须存在（404 路径不泄露任何信息）
+    # 2) 实验与受试者必须存在（404 路径不泄露任何信息）；
+    #    已退役编号（换号墓碑）不能发起紧急揭盲
     experiment_row = conn.execute(
         "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
     ).fetchone()
     if experiment_row is None:
         return None
+    if _is_tombstoned(conn, experiment_id, subject_id):
+        raise SubjectReplacedError()
     assignment_row = conn.execute(
         "SELECT sequence FROM assignments "
         "WHERE experiment_id = ? AND subject_id = ?",
@@ -1971,6 +2048,213 @@ def get_result_snapshot(
     return _snapshot_payload(row)
 
 
+def replace_subject(
+    experiment_id: str,
+    subject_id: str,
+    replacement_subject_id: str,
+    operation_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """受试者换号：把隐藏分配与进度原子转移到新编号，原编号留墓碑。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：``(experiment_id, operation_id)`` 已存在时，仅当本次
+       原编号（路径）、新编号与原因均与首次一致才重放首次结果；
+       任一不同抛出 :class:`ReplacementOperationIdConflictError`；
+    2. 存在性检查：实验不存在返回 ``None``（404）；原编号已退役
+       （换号墓碑）抛出 :class:`SubjectReplacedError`；原编号不在册
+       返回 ``None``（404）；
+    3. 新编号检查：新编号已在册或已退役（不可复用）抛出
+       :class:`ReplacementSubjectExistsError`；
+    4. 揭盲检查：原编号必须从未发生过任何揭盲——无 ``unblindings``
+       记录且无 ``unblinded`` 紧急揭盲审计，否则抛出
+       :class:`SubjectAlreadyUnblindedError`；
+    5. 转移：``assignments`` 的隐藏分配（序列内容与 ``sequence_index``
+       保持不变）与 ``subject_progress`` 进度原子改挂到新编号，
+       同事务写入原编号墓碑与换号审计记录，一起提交或一起回滚。
+
+    换号不触碰任何条件内容，审计记录只含编号 / 原因 / 时间等元数据。
+    所有失败路径（409）零写入、不消耗 ``operation_id``。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            result = _replace_subject_locked(
+                conn,
+                experiment_id,
+                subject_id,
+                replacement_subject_id,
+                operation_id,
+                reason,
+            )
+            if result is not None and not result["_replayed"]:
+                conn.execute("COMMIT")
+                committed = True
+            if result is not None:
+                result.pop("_replayed", None)
+            return result
+        finally:
+            if not committed:
+                # 重放（只读）、409、404 或异常时结束事务
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def _replace_subject_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    subject_id: str,
+    replacement_subject_id: str,
+    operation_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    # 1) 幂等命中：原 / 新编号与原因均一致才返回首次结果，否则 409
+    operation_row = conn.execute(
+        "SELECT * FROM subject_replacements "
+        "WHERE experiment_id = ? AND operation_id = ?",
+        (experiment_id, operation_id),
+    ).fetchone()
+    if operation_row is not None:
+        if (
+            operation_row["original_subject_id"] != subject_id
+            or operation_row["replacement_subject_id"] != replacement_subject_id
+            or operation_row["reason"] != reason
+        ):
+            raise ReplacementOperationIdConflictError()
+        return _subject_replacement_dict(operation_row, replayed=True)
+
+    # 2) 实验必须存在（404 路径不泄露任何信息）
+    experiment_row = conn.execute(
+        "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+    if experiment_row is None:
+        return None
+
+    # 3) 原编号已退役（墓碑）→ 409；不在册 → 404
+    if _is_tombstoned(conn, experiment_id, subject_id):
+        raise SubjectReplacedError()
+    assignment_row = conn.execute(
+        "SELECT 1 FROM assignments "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (experiment_id, subject_id),
+    ).fetchone()
+    if assignment_row is None:
+        return None
+
+    # 4) 新编号必须未被占用：在册编号与已退役墓碑均不可复用
+    replacement_assignment = conn.execute(
+        "SELECT 1 FROM assignments "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (experiment_id, replacement_subject_id),
+    ).fetchone()
+    if replacement_assignment is not None or _is_tombstoned(
+        conn, experiment_id, replacement_subject_id
+    ):
+        raise ReplacementSubjectExistsError()
+
+    # 5) 原编号必须从未揭盲：无按周期揭盲记录，也无完成的紧急揭盲
+    unblinding_row = conn.execute(
+        "SELECT 1 FROM unblindings "
+        "WHERE experiment_id = ? AND subject_id = ? LIMIT 1",
+        (experiment_id, subject_id),
+    ).fetchone()
+    if unblinding_row is not None:
+        raise SubjectAlreadyUnblindedError()
+    emergency_row = conn.execute(
+        "SELECT 1 FROM emergency_unblind_events "
+        "WHERE experiment_id = ? AND subject_id = ? AND action = 'unblinded' "
+        "LIMIT 1",
+        (experiment_id, subject_id),
+    ).fetchone()
+    if emergency_row is not None:
+        raise SubjectAlreadyUnblindedError()
+
+    # 6) 原子转移：隐藏分配（序列与下标不变）与进度改挂到新编号
+    conn.execute(
+        "UPDATE assignments SET subject_id = ? "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (replacement_subject_id, experiment_id, subject_id),
+    )
+    conn.execute(
+        "UPDATE subject_progress SET subject_id = ? "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (replacement_subject_id, experiment_id, subject_id),
+    )
+
+    # 7) 同事务落墓碑与审计（同一张表）：原编号自此退役
+    created_at = utc_now().isoformat()
+    cursor = conn.execute(
+        "INSERT INTO subject_replacements "
+        "(experiment_id, original_subject_id, replacement_subject_id, "
+        "operation_id, reason, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            experiment_id,
+            subject_id,
+            replacement_subject_id,
+            operation_id,
+            reason,
+            created_at,
+        ),
+    )
+    inserted = conn.execute(
+        "SELECT * FROM subject_replacements WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _subject_replacement_dict(inserted, replayed=False)
+
+
+def _subject_replacement_dict(
+    row: sqlite3.Row, replayed: bool = False
+) -> dict[str, Any]:
+    """换号审计行转字典；只含编号 / 原因 / 时间等元数据，不含条件内容。"""
+    return {
+        "id": row["id"],
+        "experiment_id": row["experiment_id"],
+        "original_subject_id": row["original_subject_id"],
+        "replacement_subject_id": row["replacement_subject_id"],
+        "operation_id": row["operation_id"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+        "_replayed": replayed,
+    }
+
+
+def list_subject_replacements(
+    experiment_id: str,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    """按时间倒序（最新在前）返回换号审计记录。
+
+    审计记录只含原 / 新编号、原因与时间等元数据，不含任何条件内容。
+    实验不存在时返回 ``None``。
+    """
+    with closing(get_connection()) as conn:
+        experiment_row = conn.execute(
+            "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if experiment_row is None:
+            return None
+        # id 为自增主键，与 created_at 同序；倒序即按时间倒序
+        rows = conn.execute(
+            "SELECT * FROM subject_replacements "
+            "WHERE experiment_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (experiment_id, limit, offset),
+        ).fetchall()
+    events = []
+    for row in rows:
+        event = _subject_replacement_dict(row)
+        event.pop("_replayed", None)
+        events.append(event)
+    return events
+
+
 def list_state_events(
     experiment_id: str,
     limit: int = 100,
@@ -2000,19 +2284,24 @@ def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:
 
     只返回已揭盲记录（含各自的完成时间）、下一周期以及下一周期最早可
     推进时间 ``next_available_at``，不包含完整序列或后续安排。
-    实验或受试者不存在时返回 ``None``。
+    实验或受试者不存在时返回 ``None``；已退役编号（换号墓碑）抛出
+    :class:`SubjectReplacedError`（不能查询进度）。
     """
     with closing(get_connection()) as conn:
         experiment_row = conn.execute(
             "SELECT washout_seconds FROM experiments WHERE id = ?",
             (experiment_id,),
         ).fetchone()
+        if experiment_row is None:
+            return None
+        if _is_tombstoned(conn, experiment_id, subject_id):
+            raise SubjectReplacedError()
         assignment_row = conn.execute(
             "SELECT sequence FROM assignments "
             "WHERE experiment_id = ? AND subject_id = ?",
             (experiment_id, subject_id),
         ).fetchone()
-        if assignment_row is None or experiment_row is None:
+        if assignment_row is None:
             return None
         num_periods = len(json.loads(assignment_row["sequence"]))
         washout = int(experiment_row["washout_seconds"])
